@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "insights"
+version = "0.1.0"
+description = "A data insights tool"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    {name = "Arshath", email = "marshath@gmail.com"},
+]
+dependencies = [
+    "openai>=1.73.0",
+    "python-dotenv>=1.1.0",
+    "vanna>=0.7.9",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["insights"]
+
+[tool.uv]
+constraint-dependencies = ["kaleido==0.2.1"]
