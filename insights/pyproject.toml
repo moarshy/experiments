@@ -12,8 +12,11 @@ authors = [
     {name = "Arshath", email = "marshath@gmail.com"},
 ]
 dependencies = [
+    "chromadb>=1.0.4",
+    "nltk>=3.9.1",
     "openai>=1.73.0",
     "python-dotenv>=1.1.0",
+    "scikit-learn>=1.6.1",
     "vanna>=0.7.9",
 ]
 

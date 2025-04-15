@@ -1,12 +1,12 @@
 import logging
 import sqlite3
 import datetime
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 from pydantic import BaseModel, Field
-from insights.config import UNIQUE_VALUE_THRESHOLD
 from insights.llm import call_openai_api
+from insights.utils import setup_logging
 
-logger = logging.getLogger(__name__)
+logger = setup_logging()
 
 class ColumnSummary(BaseModel):
     """Summary information for a database column."""

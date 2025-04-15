@@ -1,18 +1,19 @@
-import logging
 import json
 import pandas as pd
-from typing import Dict, Any, List, Optional, Union, Tuple
+from typing import Dict, Any, List, Optional
 from enum import Enum
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 # Import Vanna components
 from vanna.openai import OpenAI_Chat
 from vanna.chromadb import ChromaDB_VectorStore
 
 # Import from your existing modules
-from database_summary_agent import DatabaseSummary
+from insights.agents.db_summary_agent import DatabaseSummary
+from insights.utils import setup_logging
+from insights.config import OPENAI_API_KEY, DB_CONFIG
 
-logger = logging.getLogger(__name__)
+logger = setup_logging()
 
 class SQLResult(BaseModel):
     """Model for SQL query execution result."""
@@ -52,8 +53,6 @@ class Text2SQLExecuteAgent:
     """
     
     def __init__(self, 
-                 db_config: Dict[str, Any],
-                 openai_api_key: str,
                  openai_model: str = "gpt-4o-mini",
                  collection_name: str = "insights_db",
                  persist_directory: str = "./vanna_data"):
@@ -67,11 +66,11 @@ class Text2SQLExecuteAgent:
             collection_name: Name for the ChromaDB collection
             persist_directory: Directory to persist ChromaDB data
         """
-        self.db_config = db_config
+        self.db_config = DB_CONFIG
         
         # Configure Vanna agent
         self.vanna_config = {
-            'api_key': openai_api_key,
+            'api_key': OPENAI_API_KEY,
             'model': openai_model,
             'collection_name': collection_name,
             'persist_directory': persist_directory
@@ -415,20 +414,14 @@ class Text2SQLExecuteAgent:
             
         return results
 
-def main(db_config_path: str, db_summary_path: str, questions_path: str, output_path: str, openai_api_key: str):
+def main(db_summary_path: str, questions_path: str):
     """
     Entry point function to run the Text2SQL and Execute Agent.
     
     Args:
-        db_config_path: Path to database configuration file
         db_summary_path: Path to database summary file
         questions_path: Path to analysis questions file
-        output_path: Path to save results
-        openai_api_key: OpenAI API key
     """
-    # Load database configuration
-    with open(db_config_path, 'r') as f:
-        db_config = json.load(f)
     
     # Load database summary
     with open(db_summary_path, 'r') as f:
@@ -440,10 +433,7 @@ def main(db_config_path: str, db_summary_path: str, questions_path: str, output_
         analysis_questions = questions_data.get("questions", [])
     
     # Create and initialize the agent
-    agent = Text2SQLExecuteAgent(
-        db_config=db_config,
-        openai_api_key=openai_api_key
-    )
+    agent = Text2SQLExecuteAgent()
     
     # Connect to the database
     if not agent.connect_to_database():
@@ -458,23 +448,19 @@ def main(db_config_path: str, db_summary_path: str, questions_path: str, output_
     results = agent.process_analysis_questions(analysis_questions, db_summary)
     
     # Save results
-    with open(output_path, 'w') as f:
+    with open("results.json", 'w') as f:
         json.dump(results, f, indent=2)
     
-    logger.info(f"Processed {len(results)} questions. Results saved to {output_path}")
+    logger.info(f"Processed {len(results)} questions. Results saved to results.json")
 
 if __name__ == "__main__":
     import sys
-    import os
     
-    if len(sys.argv) != 6:
-        print("Usage: python text2sql_execute_agent.py <db_config_path> <db_summary_path> <questions_path> <output_path> <openai_api_key>")
+    if len(sys.argv) != 3:
+        print("Usage: python text2sql_execute_agent.py <db_summary_path> <questions_path>")
         sys.exit(1)
     
-    db_config_path = sys.argv[1]
-    db_summary_path = sys.argv[2]
-    questions_path = sys.argv[3]
-    output_path = sys.argv[4]
-    openai_api_key = sys.argv[5]
+    db_summary_path = sys.argv[1]
+    questions_path = sys.argv[2]
     
-    main(db_config_path, db_summary_path, questions_path, output_path, openai_api_key)
+    main(db_summary_path, questions_path)
