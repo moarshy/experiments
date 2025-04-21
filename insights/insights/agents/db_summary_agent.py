@@ -3,10 +3,15 @@ import sqlite3
 import datetime
 from typing import Dict, List, Any, Optional
 from pydantic import BaseModel, Field
-from insights.llm import call_openai_api
+from insights.llm import gemini_call, openai_call
 from insights.utils import setup_logging
 
 logger = setup_logging()
+
+class TimeRangeValue(BaseModel):
+    """Represents the min and max values for a time range."""
+    min: Optional[str] = None
+    max: Optional[str] = None
 
 class ColumnSummary(BaseModel):
     """Summary information for a database column."""
@@ -34,7 +39,7 @@ class TableSummary(BaseModel):
     primary_keys: List[str] = Field(default_factory=list)
     foreign_keys: List[Dict[str, str]] = Field(default_factory=list)
     has_time_data: bool = False
-    time_range: Optional[Dict[str, str]] = None  # Min and max dates for time columns
+    time_range: Optional[Dict[str, TimeRangeValue]] = None
 
 class DatabaseSummary(BaseModel):
     """Summary information for the entire database."""
@@ -42,7 +47,7 @@ class DatabaseSummary(BaseModel):
     tables: List[TableSummary]
     total_tables: int
     relationships: List[Dict[str, Any]] = Field(default_factory=list)
-
+    natural_language_summary: Optional[str] = None
 class DatabaseSummaryAgent:
     def __init__(self, db_path: str, unique_value_threshold: int = 20):
         """
@@ -287,7 +292,7 @@ class DatabaseSummaryAgent:
         in a way that would be helpful for someone planning to analyze this data.
         """
         
-        result = call_openai_api(
+        result = openai_call(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=0.3
