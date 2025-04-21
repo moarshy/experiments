@@ -3,7 +3,8 @@ import sqlite3
 import datetime
 from typing import Dict, List, Any, Optional
 from pydantic import BaseModel, Field
-from insights.llm import gemini_call, openai_call
+from insights.llm import LLM
+from insights.config import DB_SUMMARY_AGENT_LLM_PROVIDER
 from insights.utils import setup_logging
 
 logger = setup_logging()
@@ -49,7 +50,7 @@ class DatabaseSummary(BaseModel):
     relationships: List[Dict[str, Any]] = Field(default_factory=list)
     natural_language_summary: Optional[str] = None
 class DatabaseSummaryAgent:
-    def __init__(self, db_path: str, unique_value_threshold: int = 20):
+    def __init__(self, db_path: str, unique_value_threshold: int = 20, llm_provider: str = "openai"):
         """
         Initialize the Database Summary Agent.
         
@@ -60,7 +61,9 @@ class DatabaseSummaryAgent:
         self.db_path = db_path
         self.unique_value_threshold = unique_value_threshold
         self.conn = None
-        
+        self.llm_provider = llm_provider
+        self.llm = LLM.create_client(llm_provider)
+
     def connect(self) -> None:
         """Establish connection to the SQLite database."""
         try:
@@ -292,7 +295,7 @@ class DatabaseSummaryAgent:
         in a way that would be helpful for someone planning to analyze this data.
         """
         
-        result = openai_call(
+        result = self.llm.generate(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=0.3

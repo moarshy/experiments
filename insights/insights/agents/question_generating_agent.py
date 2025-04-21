@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
 
-from insights.llm import openai_call, gemini_call
+from insights.llm import LLM
 from insights.utils import setup_logging 
 
 logger = setup_logging()
@@ -117,17 +117,6 @@ Ensure the questions are directly relevant to the provided database summary and 
 Structure your response strictly as a numbered list of questions with the following keys only: questions
 Generate exactly """ + str(num_questions_to_generate) + """ questions.
 Do not include any preamble, commentary, or concluding remarks. Just the numbered questions.
-
-Example of expected output format:
-```json
-{
-    "questions": [
-        "1. What is the trend in X over the last Y months?",
-        "2. How does metric A compare between segment B and segment C?",
-        "3. Is there a correlation between feature D and outcome E?"
-    ]
-}
-```
 """
         # Format database summary
         summary_str = ""
@@ -210,17 +199,19 @@ Example of expected output format:
 
                 # Call LLM
                 if 'gpt' in model_name:
-                    response_json = openai_call(
+                    llm = LLM.create_client('openai')
+                    response_json = llm.generate(
                         user_prompt=user_prompt,
                         system_prompt=system_prompt,
                         model=model_name,
                         temperature=self.config.llm_temperature,
                         max_tokens=self.config.llm_max_output_tokens,
                         max_retries=3,
-                        expected_keys=["questions"]
+                        response_model=LLMResponse
                     )
                 else:
-                    response_json = gemini_call(
+                    llm = LLM.create_client('gemini')
+                    response_json = llm.generate(
                         user_prompt=user_prompt,
                         system_prompt=system_prompt,
                         model=model_name,
@@ -228,20 +219,18 @@ Example of expected output format:
                         max_tokens=self.config.llm_max_output_tokens,
                         thinking_budget=10000,
                         max_retries=3,
-                        expected_keys=["questions"]
+                        response_model=LLMResponse
                     )
 
                 # Parse the response
                 questions_json = self._response_parser(
-                    response=response_json["questions"], 
+                    response=response_json.questions, 
                     source_llm=model_name, 
-                    iteration_level=i)
+                    iteration_level=i
+                )
                 
                 new_questions_this_iteration.extend(questions_json)
-
                 total_iterations_run_per_model[model_name] += 1
-
-            
 
             # Add questions from this iteration to the main list
             self.all_questions.extend(new_questions_this_iteration)
