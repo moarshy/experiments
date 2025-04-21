@@ -1,717 +1,291 @@
 import json
+import time
 import logging
-from typing import Dict, Any, List, Optional, Set, Union
-from enum import Enum
+import uuid
+from typing import List, Optional, Dict, Any, Tuple
 from pydantic import BaseModel, Field
-import nltk
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-from nltk.stem import WordNetLemmatizer
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
-import networkx as nx
+import openai
 
-from insights.llm import call_openai_api
+from insights.agents.insight_agent import StructuredInsight, InsightTier
+from insights.llm import LLM, OpenAIClient # Import specific client if needed
+from insights.agents.db_summary_agent import DatabaseSummary
+from insights.config import OPENAI_API_KEY # Needed for OpenAI embeddings
+
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import AgglomerativeClustering
+
 from insights.utils import setup_logging
-from insights.agents.insight_agent import InsightTier, Insight
 
-# Set up NLTK resources
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
-    
-try:
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('stopwords')
-    
-try:
-    nltk.data.find('corpora/wordnet')
-except LookupError:
-    nltk.download('wordnet')
+logger = setup_logging(__name__)
 
-logger = setup_logging()
 
-class InsightGroup(BaseModel):
-    """Model for a group of related insights."""
-    group_id: str
-    group_name: str
-    insights: List[Insight]
-    synthesis: Optional[str] = None  # Synthesized narrative for the group
-    priority_score: float = Field(ge=0.0, le=1.0)  # Overall priority of this group
-    related_groups: List[str] = Field(default_factory=list)  # IDs of related groups
-    
-class SynthesizedInsight(BaseModel):
-    """Model for a synthesized insight created from multiple related insights."""
-    synthesis_id: str
-    source_insight_ids: List[str]  # Original insights that were synthesized
-    insight_tier: InsightTier  # Usually higher tier than source insights
-    headline: str  # Concise summary of the synthesized insight
-    description: str  # Comprehensive explanation with context
-    supporting_data: Dict[str, Any] = Field(default_factory=dict)  # Key evidence from source insights
-    visualization_suggestion: Optional[str] = None  # Suggested visualization type
-    priority_score: float = Field(ge=0.0, le=1.0)  # Priority score for this synthesis
+# --- Agent Configuration Defaults ---
+DEFAULT_DEDUPLICATION_THRESHOLD = 0.90
+DEFAULT_SYNTHESIS_CLUSTER_THRESHOLD = 0.75
+DEFAULT_PRIORITY_WEIGHTS = {"relevance": 0.4, "significance": 0.3, "confidence": 0.1, "tier": 0.2}
+DEFAULT_TIER_SCORES = { InsightTier.ANOMALY: 1.0, InsightTier.CONTRIBUTION: 0.9, InsightTier.RELATIONSHIP: 0.8, InsightTier.TREND: 0.7, InsightTier.COMPARISON: 0.6, InsightTier.OBSERVATION: 0.3, InsightTier.DATA_QUALITY: 0.2, InsightTier.EXECUTION_INFO: 0.1 }
+DEFAULT_FILTER_TOP_N = 10
+DEFAULT_OPENAI_EMBEDDING_MODEL = 'text-embedding-3-large' 
 
-class ConsolidatedInsights(BaseModel):
-    """Model for the complete set of consolidated insights."""
-    original_query: str  # The original user query
-    total_insights: int  # Total number of original insights
-    total_groups: int  # Total number of insight groups
-    total_synthesized: int  # Total number of synthesized insights
-    groups: List[InsightGroup]  # Groups of related insights
-    synthesized_insights: List[SynthesizedInsight]  # Higher-level synthesized insights
-    top_insights: List[Union[Insight, SynthesizedInsight]]  # Top overall insights (prioritized)
-    tier_distribution: Dict[str, int] = Field(default_factory=dict)  # Distribution by tier
-
-class NLTKTextProcessor:
-    """
-    Class for processing text using NLTK for similarity comparison.
-    """
-    
-    def __init__(self):
-        """Initialize the text processor."""
-        self.stop_words = set(stopwords.words('english'))
-        self.lemmatizer = WordNetLemmatizer()
-        self.vectorizer = None
-    
-    def preprocess_text(self, text: str) -> str:
-        """
-        Preprocess text for similarity comparison.
-        
-        Args:
-            text: Text to preprocess
-            
-        Returns:
-            Preprocessed text
-        """
-        # Lowercase
-        text = text.lower()
-        
-        # Tokenize
-        tokens = word_tokenize(text)
-        
-        # Remove stopwords and lemmatize
-        filtered_tokens = [self.lemmatizer.lemmatize(token) for token in tokens 
-                          if token not in self.stop_words and token.isalpha()]
-        
-        # Join back into a string
-        return ' '.join(filtered_tokens)
-    
-    def compute_similarity(self, texts: List[str]) -> np.ndarray:
-        """
-        Compute pairwise similarity matrix for a list of texts.
-        
-        Args:
-            texts: List of texts to compare
-            
-        Returns:
-            Similarity matrix as a numpy array
-        """
-        if not texts:
-            return np.array([])
-            
-        # Create or update the vectorizer
-        self.vectorizer = TfidfVectorizer()
-        tfidf_matrix = self.vectorizer.fit_transform(texts)
-        
-        # Compute cosine similarity
-        return cosine_similarity(tfidf_matrix)
-
+# --- Insight Consolidation Agent ---
 class InsightConsolidationAgent:
     """
-    Agent for consolidating, deduplicating, and synthesizing insights.
-    
-    This agent takes multiple insights, identifies similarities,
-    groups related insights, and synthesizes them into higher-level findings.
+    Consolidates raw insights using OpenAI embeddings, deduplication,
+    prioritization, synthesis, and filtering.
     """
-    
-    def __init__(self, 
-                 openai_model: str = "gpt-4o",
-                 similarity_threshold: float = 0.75,
-                 max_top_insights: int = 10):
+    def __init__(self,
+                 llm_provider: str = "openai",
+                 embedding_model_name: str = DEFAULT_OPENAI_EMBEDDING_MODEL,
+                 deduplication_threshold: float = DEFAULT_DEDUPLICATION_THRESHOLD,
+                 synthesis_cluster_threshold: float = DEFAULT_SYNTHESIS_CLUSTER_THRESHOLD,
+                 priority_weights: Dict[str, float] = None,
+                 tier_scores: Dict[InsightTier, float] = None,
+                 filter_top_n: Optional[int] = None,
+                 enable_synthesis: bool = True):
         """
-        Initialize the Insight Consolidation Agent.
-        
+        Initializes the Insight Consolidation Agent using OpenAI embeddings.
+
         Args:
-            openai_model: OpenAI model to use for synthesis
-            similarity_threshold: Threshold for considering insights similar
-            max_top_insights: Maximum number of top insights to include
+            llm_provider: LLM provider for synthesis ('openai' or 'gemini').
+            llm_model_config: Config for the synthesis LLM client.
+            embedding_model_name: Specific OpenAI embedding model name.
+            deduplication_threshold: Similarity threshold for deduplication.
+            synthesis_cluster_threshold: Similarity threshold for synthesis clustering.
+            priority_weights: Weights for ranking factors.
+            tier_scores: Scores for insight tiers.
+            filter_top_n: Keep top N insights (None to disable).
+            enable_synthesis: Flag to enable/disable synthesis step.
         """
-        self.openai_model = openai_model
-        self.similarity_threshold = similarity_threshold
-        self.max_top_insights = max_top_insights
-        self.text_processor = NLTKTextProcessor()
-        
-    def _extract_all_insights(self, insights_data: Dict[str, Any]) -> List[Insight]:
-        """
-        Extract all individual insights from the insights data.
-        
-        Args:
-            insights_data: Data from the Insight Agent
-            
-        Returns:
-            List of all individual insights
-        """
-        all_insights = []
-        
-        insight_results = insights_data.get("insights", [])
-        for result in insight_results:
-            insights = result.get("insights", [])
-            for insight in insights:
-                # Convert dict to Insight model
-                try:
-                    insight_model = Insight(**insight)
-                    all_insights.append(insight_model)
-                except Exception as e:
-                    logger.error(f"Error parsing insight: {e}")
-                    continue
-        
-        return all_insights
-    
-    def _calculate_insight_similarity(self, insights: List[Insight]) -> np.ndarray:
-        """
-        Calculate pairwise similarity between insights.
-        
-        Args:
-            insights: List of insights
-            
-        Returns:
-            Similarity matrix
-        """
-        if not insights:
-            return np.array([])
-            
-        # Combine headline and description for similarity comparison
-        texts = []
-        for insight in insights:
-            text = f"{insight.headline} {insight.description}"
-            processed_text = self.text_processor.preprocess_text(text)
-            texts.append(processed_text)
-            
-        return self.text_processor.compute_similarity(texts)
-    
-    def _deduplicate_insights(self, insights: List[Insight]) -> List[Insight]:
-        """
-        Remove duplicate or very similar insights.
-        
-        Args:
-            insights: List of insights
-            
-        Returns:
-            Deduplicated list of insights
-        """
-        if not insights:
-            return []
-            
-        # Calculate similarity matrix
-        similarity_matrix = self._calculate_insight_similarity(insights)
-        
-        # Sort insights by tier and confidence for deduplication priority
-        tier_priority = {
-            InsightTier.CONTRIBUTION: 5,
-            InsightTier.PATTERN: 4,
-            InsightTier.SIGNIFICANCE: 3,
-            InsightTier.COMPARISON: 2,
-            InsightTier.OBSERVATION: 1
-        }
-        
-        indexed_insights = list(enumerate(insights))
-        sorted_indexed_insights = sorted(
-            indexed_insights, 
-            key=lambda x: (tier_priority.get(x[1].insight_tier, 0), x[1].confidence_score),
-            reverse=True
-        )
-        
-        # Deduplicate
-        unique_indices = set()
-        duplicate_groups = []
-        
-        for i, (orig_idx, insight) in enumerate(sorted_indexed_insights):
-            # Skip if already processed as a duplicate
-            if orig_idx in unique_indices:
-                continue
-                
-            # Start a new group with this insight
-            group = [orig_idx]
-            unique_indices.add(orig_idx)
-            
-            # Find similar insights
-            for j, (other_idx, _) in enumerate(sorted_indexed_insights):
-                if other_idx == orig_idx or other_idx in unique_indices:
-                    continue
-                    
-                if similarity_matrix[orig_idx, other_idx] >= self.similarity_threshold:
-                    group.append(other_idx)
-                    unique_indices.add(other_idx)
-            
-            if len(group) > 1:
-                duplicate_groups.append(group)
-        
-        # Keep only the unique insights
-        unique_insights = []
-        for i, insight in enumerate(insights):
-            if i in unique_indices:
-                unique_insights.append(insight)
-                
-        logger.info(f"Deduplicated {len(insights)} insights to {len(unique_insights)} unique insights")
-        return unique_insights
-    
-    def _cluster_insights(self, insights: List[Insight]) -> List[List[int]]:
-        """
-        Cluster insights into related groups using similarity matrix and graph community detection.
-        
-        Args:
-            insights: List of insights
-            
-        Returns:
-            List of cluster indices
-        """
-        if not insights:
-            return []
-            
-        # Calculate similarity matrix
-        similarity_matrix = self._calculate_insight_similarity(insights)
-        
-        # Create a graph where nodes are insights and edges are weighted by similarity
-        G = nx.Graph()
-        
-        # Add nodes
-        for i in range(len(insights)):
-            G.add_node(i)
-            
-        # Add edges for similar insights (above threshold)
-        for i in range(len(insights)):
-            for j in range(i+1, len(insights)):
-                similarity = similarity_matrix[i, j]
-                if similarity >= self.similarity_threshold * 0.8:  # Lower threshold for clustering
-                    G.add_edge(i, j, weight=similarity)
-        
-        # Use community detection to find clusters
-        clusters = []
-        
-        # Handle disconnected graph
-        if nx.number_connected_components(G) > 1:
-            # Get connected components
-            for component in nx.connected_components(G):
-                clusters.append(list(component))
+        # --- LLM Client for Synthesis ---
+        self.llm_client = LLM.create_client(provider=llm_provider)
+        if self.llm_client is None:
+             raise ValueError(f"Could not create LLM client for provider: {llm_provider}")
+
+        # --- Embedding Client (OpenAI Only) ---
+        self.embedding_model_name = embedding_model_name
+        self.openai_embedding_client = None
+
+        if isinstance(self.llm_client, OpenAIClient) and hasattr(self.llm_client, 'client'):
+             # Reuse the client initialized for generation if it's OpenAI
+             self.openai_embedding_client = self.llm_client.client # Access the underlying openai.OpenAI client
+             logger.info(f"Using existing OpenAI client for embeddings (Model: {self.embedding_model_name}).")
         else:
-            # Use Louvain community detection
-            try:
-                from community import best_partition
-                partition = best_partition(G)
-                
-                # Group by community
-                community_to_nodes = {}
-                for node, community_id in partition.items():
-                    if community_id not in community_to_nodes:
-                        community_to_nodes[community_id] = []
-                    community_to_nodes[community_id].append(node)
-                
-                clusters = list(community_to_nodes.values())
-            except:
-                # Fallback to a simpler approach
-                clusters = [list(range(len(insights)))]  # All in one cluster
-        
-        # Handle case with no clustering
-        if not clusters:
-            clusters = [[i] for i in range(len(insights))]  # Each insight in its own cluster
-            
-        return clusters
-    
-    def _generate_group_name(self, insights: List[Insight]) -> str:
-        """
-        Generate a descriptive name for a group of insights.
-        
-        Args:
-            insights: List of insights in the group
-            
-        Returns:
-            Descriptive name for the group
-        """
-        if not insights:
-            return "Empty Group"
-            
-        # Extract keywords from insights
-        all_text = " ".join([f"{insight.headline} {insight.description}" for insight in insights])
-        processed_text = self.text_processor.preprocess_text(all_text)
-        
-        # Use TFIDF to find important terms
-        vectorizer = TfidfVectorizer(max_features=10)
+             self.openai_embedding_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+             logger.info(f"Created separate OpenAI client for embeddings (Model: {self.embedding_model_name}).")
+        if self.openai_embedding_client is None:
+             raise ValueError("Failed to initialize OpenAI client for embeddings.")
+
+        # --- Other Configs ---
+        self.dedup_threshold = deduplication_threshold
+        self.synth_cluster_threshold = synthesis_cluster_threshold
+        self.priority_weights = priority_weights or DEFAULT_PRIORITY_WEIGHTS
+        self.tier_scores = tier_scores or DEFAULT_TIER_SCORES
+        self.filter_top_n = filter_top_n
+        self.enable_synthesis = enable_synthesis
+
+        logger.info(f"InsightConsolidationAgent initialized. Embedding Provider: OpenAI (Model: {self.embedding_model_name}), Deduplication: {self.dedup_threshold}, Synthesis: {self.enable_synthesis}")
+
+    # --- Main Orchestration Method ---
+    def consolidate(self,
+                    insights_list: List[StructuredInsight],
+                    original_user_query: Optional[str] = None,
+                    db_summary: Optional[DatabaseSummary] = None) -> List[StructuredInsight]:
+        """Orchestrates the insight consolidation process."""
+        logger.info(f"Starting consolidation for {len(insights_list)} raw insights...")
+        # 1. Deduplication
+        unique_insights = self._deduplicate_insights(insights_list)
+        logger.info(f"Reduced to {len(unique_insights)} unique insights after deduplication.")
+        processed_insights = unique_insights
+        # 2. Synthesis (Optional)
+        if self.enable_synthesis and len(unique_insights) > 1:
+            logger.info("Attempting insight synthesis...")
+            clustered_insights, unclustered_insights = self._cluster_insights(unique_insights)
+            logger.info(f"Found {len(clustered_insights)} clusters for synthesis. {len(unclustered_insights)} insights remain unclustered.")
+            synthesized_insights = self._synthesize_clusters(clustered_insights, original_user_query, db_summary)
+            logger.info(f"Generated {len(synthesized_insights)} synthesized insights.")
+            processed_insights = synthesized_insights + unclustered_insights # Combine synthesized with non-clustered originals
+            logger.info(f"Total insights after synthesis step: {len(processed_insights)}")
+        # 3. Prioritization
+        prioritized_insights = self._prioritize_insights(processed_insights)
+        logger.info(f"Prioritized {len(prioritized_insights)} insights.")
+        # 4. Filtering
+        final_insights = self._filter_insights(prioritized_insights)
+        logger.info(f"Filtered down to {len(final_insights)} final insights.")
+        return final_insights
+
+    def _get_embeddings(self, texts: List[str]) -> np.ndarray:
+        """Generates embeddings using the configured OpenAI model."""
+        if not texts:
+            return np.array([])
+        if not self.openai_embedding_client:
+             raise ValueError("OpenAI client for embeddings not initialized.")
+
+        logger.debug(f"Generating OpenAI embeddings for {len(texts)} texts using {self.embedding_model_name}...")
         try:
-            tfidf_matrix = vectorizer.fit_transform([processed_text])
-            feature_names = vectorizer.get_feature_names_out()
-            
-            # Get top terms
-            tfidf_scores = tfidf_matrix.toarray()[0]
-            top_indices = tfidf_scores.argsort()[-3:][::-1]  # Top 3 terms
-            top_terms = [feature_names[i] for i in top_indices]
-            
-            # Create group name
-            group_name = f"Group: {', '.join(top_terms).title()}"
-            return group_name
-        except:
-            # Fallback to simpler approach
-            # Find the highest tier insight
-            tier_priority = {
-                InsightTier.CONTRIBUTION: 5,
-                InsightTier.PATTERN: 4,
-                InsightTier.SIGNIFICANCE: 3,
-                InsightTier.COMPARISON: 2,
-                InsightTier.OBSERVATION: 1
-            }
-            
-            sorted_insights = sorted(
-                insights, 
-                key=lambda x: tier_priority.get(x.insight_tier, 0),
-                reverse=True
+            # Replace empty strings or None with a placeholder if necessary,
+            # as OpenAI API might error on empty input strings.
+            processed_texts = [text if text and text.strip() else " " for text in texts]
+
+            response = self.openai_embedding_client.embeddings.create(
+                input=processed_texts,
+                model=self.embedding_model_name
             )
-            
-            # Use headline of highest tier insight
-            top_insight = sorted_insights[0]
-            return f"Group: {top_insight.headline[:30]}..."
-    
-    def _calculate_priority_score(self, 
-                                 insight: Union[Insight, SynthesizedInsight],
-                                 query_keywords: Set[str]) -> float:
-        """
-        Calculate priority score for an insight based on tier, confidence, and relevance to query.
-        
-        Args:
-            insight: The insight to score
-            query_keywords: Keywords from the original query
-            
-        Returns:
-            Priority score between 0.0 and 1.0
-        """
-        # Base weights
-        tier_weights = {
-            InsightTier.CONTRIBUTION: 1.0,
-            InsightTier.PATTERN: 0.8,
-            InsightTier.SIGNIFICANCE: 0.7,
-            InsightTier.COMPARISON: 0.5,
-            InsightTier.OBSERVATION: 0.3
-        }
-        
-        # Base score from tier
-        tier_score = tier_weights.get(insight.insight_tier, 0.5)
-        
-        # Confidence score if available (for original insights)
-        confidence_score = 0.8  # Default for synthesized insights
-        if hasattr(insight, 'confidence_score'):
-            confidence_score = insight.confidence_score
-            
-        # Keyword relevance
-        relevance_score = 0.0
-        if query_keywords:
-            # Create text from insight
-            insight_text = f"{insight.headline} {insight.description}".lower()
-            insight_words = set(self.text_processor.preprocess_text(insight_text).split())
-            
-            # Count keyword matches
-            matches = insight_words.intersection(query_keywords)
-            if matches:
-                relevance_score = len(matches) / len(query_keywords)
-        
-        # Combine scores (with weights)
-        final_score = (0.4 * tier_score) + (0.3 * confidence_score) + (0.3 * relevance_score)
-        
-        return min(max(final_score, 0.0), 1.0)  # Ensure between 0 and 1
-    
-    def _synthesize_insights(self, 
-                           group: List[Insight], 
-                           group_id: str) -> Optional[SynthesizedInsight]:
-        """
-        Synthesize a group of related insights into a higher-level insight.
-        
-        Args:
-            group: List of related insights
-            group_id: ID of the group
-            
-        Returns:
-            Synthesized insight or None if synthesis failed
-        """
-        if len(group) <= 1:
-            return None  # No need to synthesize a single insight
-            
-        # Prepare insights for LLM
-        insights_data = [insight.model_dump() for insight in group]
-        
-        system_prompt = """
-        You are an expert data analyst who specializes in synthesizing related insights into higher-level findings.
-        
-        Your task is to analyze multiple related insights and create a synthesized insight that:
-        1. Captures the most important aspects of all source insights
-        2. Provides a higher-level perspective that connects the individual insights
-        3. Draws a more significant conclusion than any individual insight
-        
-        The synthesized insight should:
-        - Have a tier that is at least as high as the highest tier in the source insights (ideally higher)
-        - Include a concise headline that captures the essence of the synthesis
-        - Provide a comprehensive description that connects all the source insights
-        - Reference supporting data from the source insights
-        - Suggest an appropriate visualization if applicable
-        
-        Your synthesis should be more valuable and insightful than the sum of the individual insights.
-        """
-        
-        user_prompt = f"""
-        SOURCE INSIGHTS:
-        {json.dumps(insights_data, indent=2)}
-        
-        Based on these related insights, create a synthesized higher-level insight that connects them and draws a more significant conclusion.
-        
-        Format your response as a JSON object with the following structure:
-        {{
-            "synthesis_id": "{group_id}-S001",
-            "source_insight_ids": ["list of IDs of the source insights"],
-            "insight_tier": "one of: observation, comparison, significance, pattern, contribution",
-            "headline": "Concise headline of the synthesized insight",
-            "description": "Comprehensive description that connects all source insights",
-            "supporting_data": {{ "key evidence": "values" }},
-            "visualization_suggestion": "Suggested visualization type" or null if not applicable
-        }}
-        """
-        
-        # Call LLM to synthesize insights
-        try:
-            synthesis_data = call_openai_api(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                response_model=SynthesizedInsight,
-                model=self.openai_model,
-                temperature=0.5
-            )
-            
-            if synthesis_data:
-                return synthesis_data
-                
+            embeddings_list = [item.embedding for item in response.data]
+
+            # Validation
+            if not embeddings_list:
+                 logger.warning("OpenAI embedding API returned no embeddings.")
+                 return np.array([])
+            if len(embeddings_list) != len(texts):
+                 logger.error(f"Mismatch in number of embeddings returned ({len(embeddings_list)}) vs texts sent ({len(texts)}).")
+                 # Handle mismatch - maybe return empty or raise error depending on desired robustness
+                 raise ValueError("OpenAI embedding count mismatch.")
+            dim = len(embeddings_list[0])
+            if not all(len(e) == dim for e in embeddings_list):
+                 logger.error("OpenAI embeddings have inconsistent dimensions.")
+                 raise ValueError("Inconsistent embedding dimensions from OpenAI.")
+
+            return np.array(embeddings_list)
         except Exception as e:
-            logger.error(f"Error synthesizing insights: {e}")
-            
-        return None
-    
-    def _identify_related_groups(self, groups: List[InsightGroup]) -> List[InsightGroup]:
-        """
-        Identify relationships between insight groups.
-        
-        Args:
-            groups: List of insight groups
-            
-        Returns:
-            Updated groups with related_groups field populated
-        """
-        if len(groups) <= 1:
-            return groups
-            
-        # Extract group texts
-        texts = []
-        for group in groups:
-            # Combine all insight texts in the group
-            group_text = " ".join([
-                f"{insight.headline} {insight.description}" 
-                for insight in group.insights
-            ])
-            
-            # Add synthesis if available
-            if group.synthesis:
-                group_text += f" {group.synthesis}"
-                
-            # Process text
-            processed_text = self.text_processor.preprocess_text(group_text)
-            texts.append(processed_text)
-            
-        # Calculate similarity matrix
-        similarity_matrix = self.text_processor.compute_similarity(texts)
-        
-        # Find related groups
-        threshold = self.similarity_threshold * 0.7  # Lower threshold for group relations
-        
-        for i, group in enumerate(groups):
-            related = []
-            for j, other_group in enumerate(groups):
-                if i != j and similarity_matrix[i, j] >= threshold:
-                    related.append(other_group.group_id)
-            
-            group.related_groups = related
-            
-        return groups
-        
-    def consolidate_insights(self, 
-                           insights_data: Dict[str, Any],
-                           original_query: str) -> ConsolidatedInsights:
-        """
-        Consolidate, deduplicate, and synthesize insights.
-        
-        Args:
-            insights_data: Data from the Insight Agent
-            original_query: The original user query
-            
-        Returns:
-            Consolidated insights
-        """
-        # Extract all insights
-        all_insights = self._extract_all_insights(insights_data)
-        
-        if not all_insights:
-            logger.warning("No insights to consolidate")
-            return ConsolidatedInsights(
-                original_query=original_query,
-                total_insights=0,
-                total_groups=0,
-                total_synthesized=0,
-                groups=[],
-                synthesized_insights=[],
-                top_insights=[]
-            )
-            
-        # Deduplicate insights
-        unique_insights = self._deduplicate_insights(all_insights)
-        
-        # Preprocess query for relevance scoring
-        query_keywords = set(self.text_processor.preprocess_text(original_query).split())
-        
-        # Cluster insights into groups
-        cluster_indices = self._cluster_insights(unique_insights)
-        
-        # Create insight groups
-        groups = []
+            logger.error(f"OpenAI embedding generation failed: {e}", exc_info=True)
+            raise # Propagate error
+
+    def _get_insight_text(self, insight: StructuredInsight) -> str:
+        """Combines key text fields for embedding."""
+        return f"{insight.headline}. {insight.description}"
+
+    def _deduplicate_insights(self, insights: List[StructuredInsight]) -> List[StructuredInsight]:
+        """Identifies and merges semantically similar insights using OpenAI embeddings."""
+        if len(insights) <= 1: return insights
+        texts_to_embed = [self._get_insight_text(i) for i in insights]
+        try:
+             embeddings = self._get_embeddings(texts_to_embed) # Use helper method
+        except Exception as e:
+             logger.error(f"Failed to get embeddings for deduplication: {e}. Skipping deduplication.")
+             return insights # Return original list if embedding fails
+
+        if embeddings.shape[0] != len(insights):
+             logger.error("Embedding count mismatch. Skipping deduplication.")
+             return insights
+
+        similarity_matrix = cosine_similarity(embeddings)
+        np.fill_diagonal(similarity_matrix, 0)
+        merged_indices = set()
+        unique_insights_list = []
+        for i in range(len(insights)):
+            if i in merged_indices: continue
+            similar_indices = np.where(similarity_matrix[i] > self.dedup_threshold)[0]
+            current_group_indices = [i] + [idx for idx in similar_indices if idx > i and idx not in merged_indices]
+            best_insight_in_group = insights[i]; max_score = self._calculate_priority_score(best_insight_in_group)
+            for group_idx in current_group_indices[1:]:
+                 current_score = self._calculate_priority_score(insights[group_idx])
+                 if current_score > max_score: max_score = current_score; best_insight_in_group = insights[group_idx]
+                 merged_indices.add(group_idx)
+            unique_insights_list.append(best_insight_in_group); merged_indices.add(i)
+        return unique_insights_list
+
+    def _cluster_insights(self, insights: List[StructuredInsight]) -> Tuple[List[List[StructuredInsight]], List[StructuredInsight]]:
+        """Groups insights into clusters using OpenAI embeddings."""
+        if len(insights) <= 1: return [], insights
+        texts_to_embed = [self._get_insight_text(i) for i in insights]
+        try:
+             embeddings = self._get_embeddings(texts_to_embed) # Use helper method
+        except Exception as e:
+             logger.error(f"Failed to get embeddings for clustering: {e}. Skipping synthesis.")
+             return [], insights # Return no clusters, all insights unclustered
+
+        if embeddings.shape[0] != len(insights):
+             logger.error("Embedding count mismatch. Skipping clustering.")
+             return [], insights
+
+        distance_threshold = 1.0 - self.synth_cluster_threshold
+        clustering = AgglomerativeClustering(n_clusters=None, distance_threshold=distance_threshold, metric='cosine', linkage='average')
+        try:
+             labels = clustering.fit_predict(embeddings)
+        except ValueError as e:
+             logger.warning(f"Clustering failed ({e}), proceeding without synthesis.")
+             return [], insights
+        clusters = {}; unclustered_indices = []
+        for i, label in enumerate(labels):
+            if label < 0: unclustered_indices.append(i); continue
+            if label not in clusters: clusters[label] = []
+            clusters[label].append(i)
+        final_clusters_indices: List[List[int]] = []
+        for indices in clusters.values(): # No need for label key now
+            if len(indices) > 1: final_clusters_indices.append(indices)
+            else: unclustered_indices.extend(indices)
+        clustered_insight_groups = [[insights[i] for i in index_group] for index_group in final_clusters_indices]
+        unclustered_insight_list = [insights[i] for i in unclustered_indices]
+        return clustered_insight_groups, unclustered_insight_list
+
+    def _synthesize_clusters(self, clustered_insight_groups: List[List[StructuredInsight]], original_user_query: Optional[str], db_summary: Optional[DatabaseSummary]) -> List[StructuredInsight]:
+        """Uses LLM to synthesize each cluster of insights."""
         synthesized_insights = []
-        
-        for i, cluster in enumerate(cluster_indices):
-            group_id = f"G{str(i+1).zfill(3)}"
-            
-            # Get insights in this cluster
-            cluster_insights = [unique_insights[idx] for idx in cluster]
-            
-            # Generate group name
-            group_name = self._generate_group_name(cluster_insights)
-            
-            # Synthesize insights if more than one
-            synthesis = None
-            if len(cluster_insights) > 1:
-                synthesized = self._synthesize_insights(cluster_insights, group_id)
-                if synthesized:
-                    synthesis = synthesized.description
-                    
-                    # Calculate priority score
-                    synthesized.priority_score = self._calculate_priority_score(synthesized, query_keywords)
-                    
-                    # Add to synthesized insights
-                    synthesized_insights.append(synthesized)
-            
-            # Calculate group priority score
-            priority_scores = [self._calculate_priority_score(insight, query_keywords) 
-                              for insight in cluster_insights]
-            group_priority = max(priority_scores) if priority_scores else 0.0
-            
-            # Create group
-            group = InsightGroup(
-                group_id=group_id,
-                group_name=group_name,
-                insights=cluster_insights,
-                synthesis=synthesis,
-                priority_score=group_priority,
-                related_groups=[]  # Will be populated later
-            )
-            
-            groups.append(group)
-            
-        # Identify related groups
-        groups = self._identify_related_groups(groups)
-        
-        # Select top insights
-        all_candidate_insights = []
-        
-        # Add synthesized insights
-        for synthesized in synthesized_insights:
-            all_candidate_insights.append(synthesized)
-            
-        # Add original insights
-        for insight in unique_insights:
-            # Calculate priority score
-            priority_score = self._calculate_priority_score(insight, query_keywords)
-            
-            # Create a wrapper with priority score
-            insight_dict = insight.model_dump()
-            insight_dict["priority_score"] = priority_score
-            
-            # Re-create to add priority_score
-            updated_insight = Insight(**insight_dict)
-            
-            all_candidate_insights.append(updated_insight)
-            
-        # Sort by priority score
-        sorted_insights = sorted(
-            all_candidate_insights,
-            key=lambda x: x.priority_score,
-            reverse=True
-        )
-        
-        # Select top N
-        top_insights = sorted_insights[:self.max_top_insights]
-        
-        # Calculate tier distribution
-        tier_distribution = {}
-        for insight in unique_insights:
-            tier = insight.insight_tier
-            tier_distribution[tier] = tier_distribution.get(tier, 0) + 1
-            
-        # Create final result
-        result = ConsolidatedInsights(
-            original_query=original_query,
-            total_insights=len(all_insights),
-            total_groups=len(groups),
-            total_synthesized=len(synthesized_insights),
-            groups=groups,
-            synthesized_insights=synthesized_insights,
-            top_insights=top_insights,
-            tier_distribution=tier_distribution
-        )
-        
-        return result
+        if not self.llm_client:
+             logger.error("LLM client not available for synthesis.")
+             return [] # Cannot synthesize without LLM client
+        for i, cluster in enumerate(clustered_insight_groups):
+            logger.info(f"Synthesizing cluster {i+1}/{len(clustered_insight_groups)}...")
+            synthesis_prompt = self._build_synthesis_prompt(cluster, original_user_query, db_summary)
+            try:
+                synthesized_insight_data = self.llm_client.generate(
+                    user_prompt=synthesis_prompt,
+                    system_prompt="You are an expert data analyst synthesizing multiple related insights into a single, higher-level summary insight. Provide your response as a JSON object matching the fields of the StructuredInsight schema provided in the user prompt.",
+                    response_model=StructuredInsight, temperature=0.2
+                )
+                if isinstance(synthesized_insight_data, StructuredInsight):
+                     synthesized_insight_data.insight_id = f"SYN-{uuid.uuid4().hex[:10]}"
+                     synthesized_insights.append(synthesized_insight_data)
+                     logger.info(f"Successfully synthesized cluster {i+1}.")
+                elif isinstance(synthesized_insight_data, str):
+                     logger.warning("LLM returned string, attempting parse for synthesis.")
+                     try:
+                          parsed_data = json.loads(synthesized_insight_data); insight = StructuredInsight(**parsed_data)
+                          insight.insight_id = f"SYN-{uuid.uuid4().hex[:10]}"; synthesized_insights.append(insight)
+                          logger.info(f"Successfully synthesized cluster {i+1} (parsed string).")
+                     except Exception as parse_error: logger.error(f"Failed to parse LLM string for synthesis: {parse_error}")
+                else: logger.error(f"Unexpected LLM response type for synthesis: {type(synthesized_insight_data)}")
+            except Exception as e: logger.error(f"LLM synthesis call failed cluster {i+1}: {e}", exc_info=True)
+        return synthesized_insights
 
-def main(insights_path: str, original_query: str, output_path: str = "consolidated_insights.json"):
-    """
-    Entry point function to run the Insight Consolidation Agent.
-    
-    Args:
-        insights_path: Path to insights JSON file from Insight Agent
-        original_query: Original user query
-        output_path: Path to save consolidated insights JSON file
-    """
-    # Load insights
-    with open(insights_path, 'r') as f:
-        insights_data = json.load(f)
-    
-    # Create agent
-    agent = InsightConsolidationAgent()
-    
-    # Consolidate insights
-    consolidated = agent.consolidate_insights(insights_data, original_query)
-    
-    # Save consolidated insights
-    with open(output_path, 'w') as f:
-        json.dump(consolidated.model_dump(), f, indent=2)
-    
-    logger.info(f"Consolidated {consolidated.total_insights} insights into {consolidated.total_groups} groups with {consolidated.total_synthesized} synthesized insights. Saved to {output_path}")
-    
-    # Print top insights
-    print(f"\nTop {len(consolidated.top_insights)} insights:")
-    for i, insight in enumerate(consolidated.top_insights):
-        if hasattr(insight, 'headline'):  # Both Insight and SynthesizedInsight have headline
-            print(f"{i+1}. [{getattr(insight, 'insight_tier', 'unknown')}] {insight.headline}")
+    def _build_synthesis_prompt(self, insights_to_synthesize: List[StructuredInsight], original_user_query: Optional[str], db_summary: Optional[DatabaseSummary]) -> str:
+        """Constructs the prompt for the LLM to synthesize insights."""
+        insights_text = ""; context = f"Original User Query: {original_user_query or 'N/A'}\n"
+        for idx, insight in enumerate(insights_to_synthesize): insights_text += f"\n--- Insight {idx+1} (ID: {insight.insight_id}) ---\nHeadline: {insight.headline}\nDesc: {insight.description}\nTier: {insight.tier}\nMetrics: {json.dumps(insight.supporting_metrics)}\n"
+        allowed_tiers = [t.value for t in InsightTier if t != InsightTier.EXECUTION_INFO]; tier_enum_str = ", ".join(allowed_tiers)
+        prompt = f"""Synthesize the following related insights into a single, higher-level insight.\n\n**Context:**\n{context}\n**Insights to Synthesize:**{insights_text}\n**Your Task:**\nGenerate a *new* insight summarizing the overarching theme. Provide: `headline`, `description`, `tier` (one of: {tier_enum_str}), `supporting_metrics` (summarized), estimated scores (`relevance_score`, `significance_score`, `confidence_score`), `potential_actions`, `further_investigation_q`.\n**Format response strictly as a single JSON object matching the schema below.**\n\n**Required JSON Output Schema:**\n```json\n{{\n  "headline": "string", "description": "string", "tier": "string (Enum: {tier_enum_str})",\n  "relevance_score": "float | null", "significance_score": "float | null", "confidence_score": "float | null",\n  "supporting_metrics": {{...}}, "supporting_examples": null,\n  "comparison_details": "string | null", "trend_pattern": "string | null", "anomaly_description": "string | null", "contribution_details": "string | null",\n  "potential_actions": ["string", ...], "further_investigation_q": ["string", ...]\n}}\n```\nProvide ONLY the JSON object."""
+        return prompt.strip()
 
-if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) < 3:
-        print("Usage: python insight_consolidation_agent.py <insights_path> <original_query> [output_path]")
-        sys.exit(1)
-    
-    insights_path = sys.argv[1]
-    original_query = sys.argv[2]
-    output_path = sys.argv[3] if len(sys.argv) > 3 else "consolidated_insights.json"
-    
-    main(insights_path, original_query, output_path)
+    def _calculate_priority_score(self, insight: StructuredInsight) -> float:
+        """Calculates a priority score based on configured weights."""
+        score = 0.0; w = self.priority_weights; relevance = insight.relevance_score if insight.relevance_score is not None else 0.5; significance = insight.significance_score if insight.significance_score is not None else 0.5; confidence = insight.confidence_score if insight.confidence_score is not None else 0.5; tier_score = self.tier_scores.get(insight.tier, 0.1); score += relevance * w.get("relevance", 0.0) + significance * w.get("significance", 0.0) + confidence * w.get("confidence", 0.0) + tier_score * w.get("tier", 0.0); total_weight = sum(w.values()); score = score / total_weight if total_weight > 0 and total_weight != 1.0 else score; return score
+
+    def _prioritize_insights(self, insights: List[StructuredInsight]) -> List[StructuredInsight]:
+        """Sorts insights based on calculated priority score (highest first)."""
+        if not insights:
+            return []
+
+        scored_insights = []
+        for i, insight in enumerate(insights):
+            try:
+                score = self._calculate_priority_score(insight)
+                scored_insights.append((score, insight))
+            except Exception as e:
+                logger.error(f"Failed to calculate priority score for insight {insight.insight_id}: {e}. Assigning score 0.", exc_info=True)
+                # Assign a default low score or skip? Assigning 0 allows it to be sorted.
+                scored_insights.append((0.0, insight))
+
+        try:
+            # Sort descending by score
+            scored_insights.sort(key=lambda x: x[0], reverse=True)
+            # Return only the insight objects in sorted order
+            return [insight for score, insight in scored_insights]
+        except Exception as e:
+            logger.error(f"Failed to sort insights during prioritization: {e}", exc_info=True)
+            # Fallback: return the original list (unsorted) if sorting fails
+            return insights
+
+    def _filter_insights(self, insights: List[StructuredInsight]) -> List[StructuredInsight]:
+        """Filters insights, e.g., keeping Top-N."""
+        if self.filter_top_n is None or self.filter_top_n <= 0: return insights; return insights[:self.filter_top_n]
