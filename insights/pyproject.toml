@@ -13,11 +13,16 @@ authors = [
 ]
 dependencies = [
     "chromadb>=1.0.4",
+    "google-genai>=1.11.0",
+    "litellm>=1.67.0",
+    "networkx>=3.4.2",
     "nltk>=3.9.1",
     "openai>=1.73.0",
+    "pip>=25.0.1",
     "python-dotenv>=1.1.0",
     "scikit-learn>=1.6.1",
     "vanna>=0.7.9",
+    "vertexai>=1.71.1",
 ]
 
 [tool.hatch.build.targets.wheel]
