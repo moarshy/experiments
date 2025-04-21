@@ -1,507 +1,322 @@
 import json
-import logging
-import statistics
-from typing import Dict, Any, List, Optional, Union
+import uuid
+import pandas as pd
+from typing import Dict, Any, List, Optional
 from enum import Enum
-from pydantic import BaseModel, Field
-from datetime import datetime
+from pydantic import BaseModel, Field, field_validator, ValidationError
+import concurrent.futures
 
-from insights.llm import call_openai_api
+# --- Local Imports ---
+from insights.agents.db_summary_agent import DatabaseSummary
+from insights.agents.text2sql_agent import ProcessedQuestionResult
 from insights.utils import setup_logging
-from insights.config import OPENAI_API_KEY, DB_CONFIG
+from insights.llm import LLM
+from insights.config import (
+    INSIGHT_AGENT_LLM_PROVIDER, MAX_CONCURRENT_WORKERS
+)
+
 logger = setup_logging()
 
+
+# --- Pydantic Models for Insights ---
 class InsightTier(str, Enum):
-    """Tiers representing the depth of an insight."""
-    OBSERVATION = "observation"  # Simple fact from the data
-    COMPARISON = "comparison"    # Comparison between two or more data points
-    SIGNIFICANCE = "significance"  # Statistical significance assessment
-    PATTERN = "pattern"          # Identified trend or pattern
-    CONTRIBUTION = "contribution"  # Causal analysis or contribution assessment
+    """Categorizes the primary nature or depth of the insight."""
+    OBSERVATION = "Observation"       # Stating a fact derived from the data (e.g., total sales).
+    COMPARISON = "Comparison"         # Comparing values within the result set or against summary stats.
+    TREND = "Trend"                   # Identifying a pattern over time within the result set.
+    ANOMALY = "Anomaly"               # Highlighting significant deviations within the result set or vs. summary stats.
+    CONTRIBUTION = "Contribution"     # Identifying key drivers/segments responsible for an outcome in the results.
+    RELATIONSHIP = "Relationship"     # Describing a correlation or link found *within* the result data (e.g., between two metrics).
+    DATA_QUALITY = "Data Quality"     # Highlighting potential issues found in the result data (e.g., unexpected NULLs, outliers suggesting errors).
+    EXECUTION_INFO = "Execution Info" # Insight about the query execution itself (e.g., failure, long runtime, empty result set).
 
-class Insight(BaseModel):
-    """Model for a structured insight derived from data."""
-    insight_id: str
-    question_id: str  # ID of the question that generated this insight
-    insight_tier: InsightTier
-    headline: str  # Concise summary
-    description: str  # Detailed explanation
-    supporting_data: Dict[str, Any] = Field(default_factory=dict)  # Key evidence from results
-    comparison_point: Optional[Dict[str, Any]] = None  # Benchmark or historical data
-    significance_metric: Optional[Dict[str, Any]] = None  # Statistical context
-    confidence_score: float = Field(ge=0.0, le=1.0)  # Confidence in the insight
-    visualization_suggestion: Optional[str] = None  # Suggested visualization type
+class StructuredInsight(BaseModel):
+    """Represents a single, structured insight derived from query results."""
+    insight_id: str = Field(default_factory=lambda: f"INS-{uuid.uuid4().hex[:12]}", description="Unique identifier for the insight.")
+    question_id: str = Field(..., description="ID of the AnalysisQuestion this insight addresses.")
+    question_text: str = Field(..., description="The original question text for context.")
 
-class InsightResult(BaseModel):
-    """Model for the complete insight analysis result."""
-    query: str  # Original SQL query
-    question: str  # Original question
-    question_id: str  # ID of the question
-    insights: List[Insight]  # Generated insights
-    total_insights: int  # Total number of insights generated
-    tier_distribution: Dict[str, int] = Field(default_factory=dict)  # Distribution by tier
+    headline: str = Field(..., min_length=5, max_length=150, description="A concise, impactful headline summarizing the core insight.")
+    description: str = Field(..., min_length=10, description="Detailed explanation of the insight, its context, potential implications (the 'so what?').")
+    tier: InsightTier = Field(..., description="The category classifying the type of analysis/finding.")
 
-class InsightResults(BaseModel):
-    """Model for the complete insight analysis result."""
-    insights: List[Insight]
+    # --- Supporting Evidence & Context ---
+    supporting_metrics: Dict[str, Any] = Field(default_factory=dict, description="Key aggregated data points/metrics from results supporting the insight (e.g., {'Region A Sales': 1200, 'Region B Sales': 1000, '% Change': 20.0}).")
+    supporting_examples: Optional[List[Dict[str, Any]]] = Field(None, max_items=5, description="Optional: 1-3 sample rows from results illustrating the point, if metrics aren't sufficient.")
+
+    # Specific fields for certain tiers (Optional, populated based on tier)
+    comparison_details: Optional[str] = Field(None, description="Describes the baseline for COMPARISON or ANOMALY tiers (e.g., 'Region B', 'Previous Month', 'Overall Average').")
+    trend_pattern: Optional[str] = Field(None, description="Describes the pattern for TREND tier (e.g., 'Consistent Increase', 'Seasonal Peak').")
+    anomaly_description: Optional[str] = Field(None, description="Specific description of the deviation for ANOMALY tier.")
+    contribution_details: Optional[str] = Field(None, description="Details for CONTRIBUTION tier (e.g., 'Top 3 Categories accounted for 85%').")
+
+    # --- Evaluation & Next Steps ---
+    relevance_score: Optional[float] = Field(None, ge=0.0, le=1.0, description="Estimated relevance to the original user query/question (0.0-1.0).")
+    significance_score: Optional[float] = Field(None, ge=0.0, le=1.0, description="Estimated impact, surprise factor, or magnitude (0.0-1.0).")
+    confidence_score: Optional[float] = Field(None, ge=0.0, le=1.0, description="Estimated confidence in the finding based on data quality/ambiguity (0.0-1.0).")
+
+    potential_actions: List[str] = Field(default_factory=list, description="Suggested business actions or decisions based on the insight.")
+    further_investigation_q: List[str] = Field(default_factory=list, description="Suggested follow-up analytical questions.")
+
+    # --- Source Provenance ---
+    source_sql: str = Field(..., description="The SQL query that generated the data for this insight.")
+    data_row_count: Optional[int] = Field(None, description="Number of rows in the result set used for this insight.")
+    data_column_names: Optional[List[str]] = Field(None, description="Columns present in the result set.")
+    execution_time: Optional[float] = Field(None, description="Execution time of the source SQL query.")
+    error_info: Optional[str] = Field(None, description="Error message if the insight relates to a data retrieval/processing failure.")
+
+    @field_validator('headline', 'description')
+    @classmethod
+    def check_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Headline and description cannot be empty or just whitespace.")
+        return v.strip()
+
+class LLMResponse(BaseModel):
+    insights: List[StructuredInsight]
+
+# --- Insight Agent Class ---
 
 class InsightAgent:
     """
-    Agent for generating insights from SQL query results.
-    
-    This agent analyzes data returned from SQL queries and generates
-    structured insights at various levels of depth.
+    Analyzes results from a single query execution (ProcessedQuestionResult)
+    and generates structured insights using an LLM.
     """
-    
-    def __init__(self, 
-                 openai_model: str = "gpt-4o-mini",
-                 min_confidence_threshold: float = 0.7):
+    def __init__(self):
         """
-        Initialize the Insight Agent.
-        
+        Initializes the Insight Agent.
+        """
+        self.llm = LLM.create_client(INSIGHT_AGENT_LLM_PROVIDER)
+        logger.info("InsightAgent initialized.")
+
+    def generate_insights(self,
+                          processed_questions: List[ProcessedQuestionResult],
+                          db_summary: DatabaseSummary,
+                          original_user_query: Optional[str] = None) -> List[StructuredInsight]:
+        """
+        Generates a list of structured insights for a given ProcessedQuestionResult.
+        """
+
+        insights = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_WORKERS) as executor:
+            futures = [executor.submit(self.generate_insights_per_question, processed_question, db_summary, original_user_query) for processed_question in processed_questions]
+            for future in concurrent.futures.as_completed(futures):
+                insights.extend(future.result())
+        return insights
+
+    def generate_insights_per_question(self,
+                          processed_question: ProcessedQuestionResult,
+                          db_summary: DatabaseSummary,
+                          original_user_query: Optional[str] = None) -> List[StructuredInsight]:
+        """
+        Generates a list of structured insights for a given ProcessedQuestionResult.
+
         Args:
-            openai_model: OpenAI model to use for insight generation
-            min_confidence_threshold: Minimum confidence score for insights to be included
-        """
-        self.openai_model = openai_model
-        self.min_confidence_threshold = min_confidence_threshold
-        
-    def _generate_insight_id(self, question_id: str, index: int) -> str:
-        """
-        Generate a unique insight ID.
-        
-        Args:
-            question_id: The question ID that generated this insight
-            index: The insight index for this question
-            
+            processed_question: The result object from the Text2SQLExecuteAgent.
+            db_summary: The summary of the database for context.
+            original_user_query: The initial high-level query from the user.
+
         Returns:
-            A formatted insight ID (e.g., Q001-I001)
+            A list of StructuredInsight objects. Returns an empty list if no
+            insights could be generated or if input indicates failure/no data
+            and error insights are generated instead.
         """
-        return f"{question_id}-I{str(index+1).zfill(3)}"
-    
-    def _analyze_data_statistics(self, 
-                               data: List[Dict[str, Any]],
-                               column_names: List[str]) -> Dict[str, Any]:
-        """
-        Calculate basic statistics on the data.
-        
-        Args:
-            data: The data to analyze
-            column_names: Names of columns in the data
-            
-        Returns:
-            Dictionary of statistical information
-        """
-        stats = {}
-        
+
+
+        qid = processed_question.question_id
+
+        # --- 1. Handle Execution Errors or Processing Errors ---
+        if not processed_question.execution_success or processed_question.processing_error:
+            error_msg = processed_question.execution_error_message or processed_question.processing_error or "Unknown error"
+            headline = "Query Execution or Processing Failed"
+            description = f"Could not retrieve or process data for question ID '{qid}': '{processed_question.question_text}'. Error: {error_msg}"
+            if processed_question.generated_sql:
+                 description += f"\nAttempted SQL: {processed_question.generated_sql}"
+
+            error_insight = StructuredInsight(
+                question_id=qid,
+                question_text=processed_question.question_text,
+                headline=headline,
+                description=description,
+                tier=InsightTier.EXECUTION_INFO,
+                source_sql=processed_question.generated_sql or "SQL not generated or processing failed earlier",
+                error_info=error_msg,
+                data_row_count=0,
+                data_column_names=processed_question.execution_column_names or [],
+                execution_time=processed_question.execution_time,
+                relevance_score=1.0, # High relevance as it blocks analysis
+                significance_score=0.5 # Depends on question criticality
+            )
+            logger.warning(f"Generating EXECUTION_INFO insight for failed question ID: {qid}")
+            return [error_insight]
+
+        # --- 2. Handle Empty Result Sets ---
+        if not processed_question.execution_data:
+             headline = "Query Returned No Data"
+             description = f"The query for question ID '{qid}': '{processed_question.question_text}' executed successfully but returned zero matching records."
+             empty_insight = StructuredInsight(
+                 question_id=qid,
+                 question_text=processed_question.question_text,
+                 headline=headline,
+                 description=description,
+                 tier=InsightTier.OBSERVATION, # Could also be EXECUTION_INFO
+                 source_sql=processed_question.generated_sql,
+                 data_row_count=0,
+                 data_column_names=processed_question.execution_column_names or [],
+                 execution_time=processed_question.execution_time,
+                 relevance_score=0.8, # Relevant that no data exists
+                 significance_score=0.3 # Significance depends on whether data was expected
+             )
+             logger.info(f"Generating OBSERVATION insight for empty result set for question ID: {qid}")
+             return [empty_insight]
+
+        prompt = self._build_insight_prompt(
+            processed_question,
+            db_summary,
+            original_user_query
+        )
+        llm_response = self.llm.generate(
+            system_prompt="You are an expert data analyst. Your task is to analyze the provided query results in context and generate structured, actionable insights in JSON format according to the provided schema. Focus on comparisons, trends, anomalies, and significance. Provide ONLY the JSON object containing an 'insights' list.",
+            user_prompt=prompt,
+            response_model=LLMResponse
+        )
+        return llm_response.insights
+
+    def _build_insight_prompt(self,
+                              processed_question: ProcessedQuestionResult,
+                              db_summary: DatabaseSummary,
+                              original_user_query: Optional[str]) -> str:
+        """Constructs the detailed prompt for the LLM to generate insights."""
+
+        # --- Summarize Execution Data ---
+        data_summary_str = self._summarize_execution_data(
+            processed_question.execution_data or [], # Handle potential None
+            processed_question.execution_column_names or []
+        )
+
+        # --- Prepare Database Context ---
+        # Keep context concise, focus on potentially relevant parts if possible
+        db_nl_summary = "Not available"
+        if db_summary and hasattr(db_summary, 'natural_language_summary') and db_summary.natural_language_summary:
+            db_nl_summary = db_summary.natural_language_summary
+
+        db_context_str = f"General Database Context:\n{db_nl_summary}\n"
+
+        # --- Define Tiers for Prompt ---
+        allowed_tiers = [t.value for t in InsightTier if t not in [InsightTier.EXECUTION_INFO]]
+        tier_enum_str = ", ".join(allowed_tiers)
+
+        # --- Construct Prompt ---
+        prompt = f"""
+Analyze the following data query results to generate insightful findings.
+
+**1. Analysis Task Context:**
+   - Original User Query (if provided): "{original_user_query or 'Not provided'}"
+   - Specific Question Asked: "{processed_question.question_text}"
+   - SQL Query Used: ```sql
+{processed_question.generated_sql}
+```
+
+**2. Data Query Results Summary:**
+   - Row Count: {processed_question.execution_row_count}
+   - Columns: {", ".join(processed_question.execution_column_names or [])}
+   - Data Summary / Snippet:
+     ```
+     {data_summary_str}
+     ```
+
+**3. Broader Database Context:**
+   {db_context_str}
+
+**4. Your Task:**
+   - Analyze the 'Data Query Results Summary' considering the 'Specific Question Asked' and 'Broader Database Context'.
+   - Identify 1-3 distinct, meaningful insights based *only* on the provided data and context. Do not assume external knowledge or data not present.
+   - Focus on findings like: Comparisons between groups/segments, simple Trends (if time data exists in results), significant Anomalies/deviations, Contributions of segments to totals, or interesting Relationships between metrics.
+   - For each insight found, provide:
+     - A concise `headline` (5-150 chars).
+     - A detailed `description` explaining the finding and its importance/implications (min 10 chars).
+     - An appropriate `tier` (must be one of: {tier_enum_str}).
+     - A `supporting_metrics` dictionary with key calculated values supporting the headline (e.g., averages, totals, percentage changes).
+     - Optionally, `comparison_details`, `trend_pattern`, `anomaly_description`, or `contribution_details` specific to the insight tier.
+     - Estimate `relevance_score`, `significance_score`, and `confidence_score` (0.0-1.0, null if not applicable).
+     - Suggest 1-2 `potential_actions` (brief business actions) and 1-2 `further_investigation_q` (follow-up questions).
+   - **Format your entire response strictly as a single JSON object with a single key "insights". The value of "insights" must be a list of JSON objects, each conforming to the StructuredInsight schema provided below.**
+"""
+        return prompt.strip()
+
+
+    def _summarize_execution_data(self, data: List[Dict[str, Any]], columns: List[str]) -> str:
+        """Creates a concise text summary of the execution data for the LLM prompt."""
         if not data:
-            return stats
-            
-        # Analyze each column
-        for col in column_names:
-            # Extract column values (skipping nulls/None)
-            values = [row.get(col) for row in data if col in row and row[col] is not None]
-            
-            # Skip empty columns
-            if not values:
-                continue
-                
-            col_stats = {}
-            
-            # Check if values are numeric
-            try:
-                numeric_values = [float(v) for v in values if v != ""]
-                if numeric_values:
-                    col_stats["min"] = min(numeric_values)
-                    col_stats["max"] = max(numeric_values)
-                    col_stats["mean"] = statistics.mean(numeric_values)
-                    col_stats["median"] = statistics.median(numeric_values)
-                    if len(numeric_values) > 1:
-                        col_stats["std_dev"] = statistics.stdev(numeric_values)
-            except (ValueError, TypeError):
-                # Not numeric, treat as categorical
-                value_counts = {}
-                for v in values:
-                    if v in value_counts:
-                        value_counts[v] += 1
+            return "No data returned."
+
+        num_rows = len(data)
+        summary_lines = []
+        max_summary_chars = 1500 # Limit summary size to avoid huge prompts
+
+        try:
+            # Use Pandas for quick stats if available and data is suitable
+            df = pd.DataFrame(data)
+            current_len = 0
+
+            # Numeric Stats
+            numeric_cols = df.select_dtypes(include='number').columns
+            if not numeric_cols.empty:
+                 stats = df[numeric_cols].describe().to_string()
+                 if len(stats) < max_summary_chars - current_len:
+                     summary_lines.append("Numeric Column Statistics:\n" + stats)
+                     current_len += len(stats) + 28 # Approx length of header
+
+            # Categorical Stats (Value Counts)
+            categorical_cols = df.select_dtypes(include=['object', 'category']).columns
+            if current_len < max_summary_chars and not categorical_cols.empty:
+                summary_lines.append("\nCategorical Column Value Counts (Top 5):")
+                current_len += 40
+                for col in categorical_cols:
+                    counts_header = f"\n-- Column '{col}' --\n"
+                    counts = df[col].value_counts().head(5).to_string()
+                    if len(counts_header) + len(counts) < max_summary_chars - current_len:
+                        summary_lines.append(counts_header + counts)
+                        current_len += len(counts_header) + len(counts)
                     else:
-                        value_counts[v] = 1
-                        
-                # Get top categories
-                sorted_counts = sorted(value_counts.items(), key=lambda x: x[1], reverse=True)
-                col_stats["value_counts"] = {k: v for k, v in sorted_counts[:10]}  # Top 10 categories
-                col_stats["unique_count"] = len(value_counts)
-                
-            # Add to overall stats
-            stats[col] = col_stats
-            
-        return stats
-    
-    def _detect_time_series(self, 
-                           data: List[Dict[str, Any]],
-                           column_names: List[str]) -> Optional[str]:
-        """
-        Detect if data has a time series column.
-        
-        Args:
-            data: The data to analyze
-            column_names: Names of columns in the data
-            
-        Returns:
-            Name of time series column if found, None otherwise
-        """
-        if not data:
-            return None
-            
-        # Look for date/time columns
-        for col in column_names:
-            # Check first few values to see if they could be dates
-            sample_values = [row.get(col) for row in data[:5] if col in row and row[col] is not None]
-            
-            if not sample_values:
-                continue
-                
-            # Try to parse as dates
-            try:
-                # Try different date formats
-                date_formats = [
-                    "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y",
-                    "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"
-                ]
-                
-                for fmt in date_formats:
-                    try:
-                        # Try to parse the first value
-                        datetime.strptime(str(sample_values[0]), fmt)
-                        return col  # Success - this is likely a date column
-                    except ValueError:
-                        continue
-            except:
-                continue
-                
-        return None
-    
-    def _extract_context_from_db_summary(self, 
-                                       db_summary: Dict[str, Any],
-                                       tables: List[str]) -> str:
-        """
-        Extract relevant context from the database summary for the specified tables.
-        
-        Args:
-            db_summary: The database summary
-            tables: Tables mentioned in the query
-            
-        Returns:
-            Relevant context as a string
-        """
-        if not db_summary or not tables:
-            return ""
-            
-        context = []
-        
-        # Get natural language summary
-        nl_summary = db_summary.get("natural_language_summary", "")
-        if nl_summary:
-            context.append(nl_summary)
-            
-        # Extract information about the specified tables
-        tech_summary = db_summary.get("technical_summary", {})
-        db_tables = tech_summary.get("tables", [])
-        
-        for table in db_tables:
-            table_name = table.get("name", "")
-            if table_name in tables:
-                # Add table information
-                row_count = table.get("row_count", 0)
-                context.append(f"Table {table_name} has {row_count} rows.")
-                
-                # Add information about time data if available
-                if table.get("has_time_data", False) and table.get("time_range"):
-                    time_info = []
-                    for col, range_info in table.get("time_range", {}).items():
-                        time_info.append(f"Column {col} has date range from {range_info.get('min')} to {range_info.get('max')}.")
-                    context.extend(time_info)
-                    
-                # Add column information for columns with few unique values
-                for column in table.get("columns", []):
-                    if "distribution" in column and column.get("distinct_count", 0) <= 20:
-                        col_name = column.get("name", "")
-                        dist = column.get("distribution", {})
-                        context.append(f"Column {col_name} in table {table_name} has these values: {dist}")
-        
-        return "\n".join(context)
-    
-    def generate_insights(self, 
-                         query_result: Dict[str, Any],
-                         user_query: str,
-                         db_summary: Dict[str, Any]) -> InsightResult:
-        """
-        Generate insights from SQL query results.
-        
-        Args:
-            query_result: Result from the Text2SQL agent
-            user_query: Original user query
-            db_summary: Summary of the database
-            
-        Returns:
-            Structured insights about the data
-        """
-        # Extract necessary information
-        sql_query = query_result.get("sql", "")
-        question = query_result.get("question", "")
-        question_id = query_result.get("question_id", "Q000")
-        execution_result = query_result.get("execution_result", {})
-        
-        # Check if the query was successful
-        if not execution_result.get("success", False):
-            logger.error(f"Cannot generate insights for failed query: {execution_result.get('error_message')}")
-            return InsightResult(
-                query=sql_query,
-                question=question,
-                question_id=question_id,
-                insights=[],
-                total_insights=0
-            )
-            
-        # Extract data
-        data = execution_result.get("data", [])
-        if not data:
-            logger.warning(f"No data returned from query: {sql_query}")
-            return InsightResult(
-                query=sql_query,
-                question=question,
-                question_id=question_id,
-                insights=[],
-                total_insights=0
-            )
-            
-        # Extract column names
-        column_names = execution_result.get("column_names", [])
-        
-        # Calculate statistics on the data
-        data_stats = self._analyze_data_statistics(data, column_names)
-        
-        # Detect if there's a time series column
-        time_column = self._detect_time_series(data, column_names)
-        
-        # Extract tables from the query
-        tables = []
-        
-        # Simple parsing to extract table names from the SQL query
-        sql_lower = sql_query.lower()
-        from_pos = sql_lower.find("from ")
-        if from_pos != -1:
-            where_pos = sql_lower.find("where", from_pos)
-            group_pos = sql_lower.find("group by", from_pos)
-            order_pos = sql_lower.find("order by", from_pos)
-            having_pos = sql_lower.find("having", from_pos)
-            
-            end_pos = min([pos for pos in [where_pos, group_pos, order_pos, having_pos] if pos != -1], default=len(sql_lower))
-            
-            tables_str = sql_lower[from_pos + 5:end_pos].strip()
-            tables = [t.strip().split(" ")[-1] for t in tables_str.split(",")]
-            
-            # Handle joins
-            join_keywords = ["join", "inner join", "left join", "right join", "full join"]
-            for keyword in join_keywords:
-                pos = 0
-                while True:
-                    pos = sql_lower.find(f"{keyword} ", pos)
-                    if pos == -1:
-                        break
-                    on_pos = sql_lower.find(" on ", pos)
-                    if on_pos == -1:
-                        break
-                    table_name = sql_lower[pos + len(keyword) + 1:on_pos].strip()
-                    tables.append(table_name.split(" ")[-1])
-                    pos = on_pos
-        
-        # Extract context from database summary
-        db_context = self._extract_context_from_db_summary(db_summary, tables)
-        
-        # Prepare data for the LLM
-        # Limit to a reasonable number of rows to avoid token limits
-        max_rows = 100
-        data_sample = data[:max_rows]
-        
-        # Prepare prompt for the LLM
-        system_prompt = """
-        You are an expert data analyst who specializes in finding insightful patterns in SQL query results.
-        
-        Your task is to analyze the data provided and generate multiple insights with different levels of depth:
-        
-        1. OBSERVATION: Simple factual observations directly from the data
-        2. COMPARISON: Comparisons between different data points, segments, or categories
-        3. SIGNIFICANCE: Assessments of statistical significance or importance
-        4. PATTERN: Identification of trends, patterns, or correlations
-        5. CONTRIBUTION: Analysis of potential causal factors or contributions
-        
-        For each insight, provide:
-        - An insight tier (one of the five levels above)
-        - A concise headline summarizing the insight
-        - A detailed explanation with context
-        - Supporting data (specific numbers or facts from the data)
-        - Comparison points (if applicable)
-        - Statistical metrics (if applicable)
-        - A confidence score (0.0-1.0) indicating your confidence in the insight
-        - A suggestion for how to visualize this insight (if applicable)
-        
-        Your insights should be data-driven, specific, and actionable. They should answer the original question and provide additional value beyond simple observations.
-        """
-        
-        user_prompt = f"""
-        ORIGINAL USER QUERY: "{user_query}"
-        
-        QUESTION: "{question}"
-        
-        SQL QUERY: {sql_query}
-        
-        QUERY RESULTS (first {len(data_sample)} rows):
-        {json.dumps(data_sample, indent=2)}
-        
-        COLUMN STATISTICS:
-        {json.dumps(data_stats, indent=2)}
-        
-        CONTEXT FROM DATABASE:
-        {db_context}
-        
-        TIME SERIES COLUMN (if identified): {time_column if time_column else "None"}
-        
-        Based on the above information, generate 3-5 insights at different levels of depth (observation, comparison, significance, pattern, contribution).
-        
-        Format each insight as a JSON object with the following structure:
-        {{
-            "insight_id": "I001",  // Will be assigned later
-            "insight_tier": "one of: observation, comparison, significance, pattern, contribution",
-            "headline": "Concise summary of the insight",
-            "description": "Detailed explanation with context",
-            "supporting_data": {{ "key metrics or evidence": "values" }},
-            "comparison_point": {{ "benchmark or comparison": "values" }} or null if not applicable,
-            "significance_metric": {{ "statistical context": "values" }} or null if not applicable,
-            "confidence_score": 0.85,  // Between 0.0 and 1.0
-            "visualization_suggestion": "Suggested chart type" or null if not applicable
-        }}
-        
-        Return an array of these insight objects. The key of the json object is "insights".
-        """
-        
-        # Call LLM to generate insights
-        logger.info(f"Generating insights for question: {question}")
-        insights_data = call_openai_api(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            response_model=InsightResults,
-            model=self.openai_model,
-            temperature=0.5
-        )
-        
-        if not insights_data:
-            logger.error(f"Failed to generate insights for question: {question}")
-            return InsightResult(
-                query=sql_query,
-                question=question,
-                question_id=question_id,
-                insights=[],
-                total_insights=0
-            )
-        
-        # Add question_id and generate insight_id for each insight
-        for i, insight in enumerate(insights_data.insights):
-            insight.question_id = question_id
-            insight.insight_id = self._generate_insight_id(question_id, i)
-        
-        # Filter low-confidence insights
-        filtered_insights = [i for i in insights_data.insights if i.confidence_score >= self.min_confidence_threshold]
-        
-        # Calculate tier distribution
-        tier_distribution = {}
-        for insight in filtered_insights:
-            tier = insight.insight_tier
-            tier_distribution[tier] = tier_distribution.get(tier, 0) + 1
-        
-        return InsightResult(
-            query=sql_query,
-            question=question,
-            question_id=question_id,
-            insights=filtered_insights,
-            total_insights=len(filtered_insights),
-            tier_distribution=tier_distribution
-        )
-    
-    def process_query_results(self, 
-                            query_results: List[Dict[str, Any]],
-                            user_query: str,
-                            db_summary: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Process multiple query results and generate insights for each.
-        
-        Args:
-            query_results: List of results from the Text2SQL agent
-            user_query: Original user query
-            db_summary: Summary of the database
-            
-        Returns:
-            Dictionary with insights for each query result
-        """
-        all_insights = []
-        
-        for query_result in query_results:
-            # Check if query was successful
-            if "execution_result" not in query_result or not query_result["execution_result"].get("success", False):
-                logger.warning(f"Skipping failed query result: {query_result.get('question', 'Unknown question')}")
-                continue
-                
-            # Generate insights for this query result
-            insights = self.generate_insights(query_result, user_query, db_summary)
-            
-            # Add to overall results
-            all_insights.append(insights.model_dump())
-        
-        return {
-            "user_query": user_query,
-            "total_results": len(all_insights),
-            "insights": all_insights
-        }
+                        summary_lines.append(f"\n-- Column '{col}' (Skipped due to length) --")
+                        break # Stop adding categorical summaries if too long
 
-def main(query_results_path: str, db_summary_path: str, user_query: str, output_path: str = "insights.json"):
-    """
-    Entry point function to run the Insight Agent.
-    
-    Args:
-        query_results_path: Path to query results JSON file
-        db_summary_path: Path to database summary JSON file
-        user_query: Original user query
-        output_path: Path to save insights JSON file
-    """
-    # Load query results
-    with open(query_results_path, 'r') as f:
-        query_results = json.load(f)
-    
-    # Load database summary
-    with open(db_summary_path, 'r') as f:
-        db_summary = json.load(f)
-    
-    # Create insight agent
-    agent = InsightAgent()
-    
-    # Process query results
-    insights = agent.process_query_results(query_results, user_query, db_summary)
-    
-    # Save insights
-    with open(output_path, 'w') as f:
-        json.dump(insights, f, indent=2)
-    
-    logger.info(f"Generated insights for {len(insights['insights'])} query results. Saved to {output_path}")
+            # Fallback/Supplement: Row Samples if stats are missing or short
+            if not summary_lines or current_len < 500: # Add samples if summary is very short
+                 sample_count = min(num_rows, 3) # Show fewer rows if stats are present
+                 header = f"\n\nSample Rows (First {sample_count} of {num_rows}):"
+                 summary_lines.append(header)
+                 current_len += len(header)
+                 for i in range(sample_count):
+                     row_dict = data[i]
+                     # Simple string conversion, truncate long values
+                     row_str = ", ".join([f"{k}: '{str(v)[:30]}...'" if isinstance(v, str) and len(str(v)) > 30 else f"{k}: {v}" for k, v in row_dict.items()])
+                     line = f"- {row_str}"
+                     if len(line) < max_summary_chars - current_len:
+                         summary_lines.append(line)
+                         current_len += len(line)
+                     else:
+                         summary_lines.append("- (Row skipped due to length)")
+                         break
+                 if num_rows > sample_count and current_len < max_summary_chars:
+                     summary_lines.append(f"... ({num_rows - sample_count} more rows total)")
 
-if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) < 4:
-        print("Usage: python insight_agent.py <query_results_path> <db_summary_path> <user_query> ")
-        sys.exit(1)
-    
-    query_results_path = sys.argv[1]
-    db_summary_path = sys.argv[2]
-    user_query = sys.argv[3]
-    
-    main(query_results_path, db_summary_path, user_query)
+
+        except ImportError:
+            logger.warning("Pandas not installed. Using basic row sampling for data summary.")
+            # Basic row sampling without pandas
+            sample_count = min(num_rows, 5)
+            summary_lines.append(f"Sample Rows (First {sample_count} of {num_rows}):")
+            for i in range(sample_count):
+                 row_dict = data[i]
+                 row_str = ", ".join([f"{k}: '{str(v)[:30]}...'" if isinstance(v, str) and len(str(v)) > 30 else f"{k}: {v}" for k, v in row_dict.items()])
+                 summary_lines.append(f"- {row_str}")
+            if num_rows > sample_count:
+                summary_lines.append(f"... ({num_rows - sample_count} more rows total)")
+
+        except Exception as e:
+             logger.error(f"Error during data summarization: {e}", exc_info=True)
+             return f"Error summarizing data: {e}. First row: {str(data[0]) if data else 'N/A'}"
+
+        return "\n".join(summary_lines)[:max_summary_chars] # Ensure final length limit
