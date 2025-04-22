@@ -612,4 +612,4 @@ e.g., "Combine the LSTM approach from [ID1] with the risk management technique f
 if __name__ == "__main__":
     print(f"Connecting Gradio frontend to API at: {API_BASE_URL}")
     # Use settings for server name and port
-    demo.launch(server_name=settings.GRADIO_SERVER_NAME, server_port=settings.GRADIO_SERVER_PORT)
+    demo.launch(server_name=settings.GRADIO_SERVER_NAME, server_port=settings.GRADIO_SERVER_PORT, share=True)
