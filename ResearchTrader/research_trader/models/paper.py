@@ -4,61 +4,73 @@ Paper data models for ResearchTrader
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl
+
+
+class PaperMetadata(BaseModel):
+    """Basic metadata retrieved from ArXiv."""
+
+    paper_id: str = Field(..., description="Unique identifier for the paper (e.g., ArXiv ID).")
+    title: str = Field(..., description="Title of the paper.")
+    authors: list[str] = Field(default_factory=list, description="List of author names.")
+    abstract: str = Field(..., description="Abstract of the paper.")
+    published_date: datetime | None = Field(None, description="Date the paper was published.")
+    pdf_url: HttpUrl | None = Field(None, description="Direct URL to the paper's PDF.")
+    source_url: HttpUrl | None = Field(
+        None, description="URL to the paper's page (e.g., ArXiv page)."
+    )
+    tags: list[str] = Field(default_factory=list, description="Relevant tags or categories.")
+
+
+class PaperContent(BaseModel):
+    """Extracted content and analysis of the paper."""
+
+    full_text: str | None = Field(None, description="Full text extracted from the PDF.")
+    structured_summary: dict[str, str | list[str]] | None = Field(
+        None,
+        description="Structured summary (Objective: str, Methods: List[str], Results: List[str], Conclusions: List[str]).",
+    )
+    comprehensive_summary: str | None = Field(
+        None, description="LLM-generated comprehensive summary."
+    )
 
 
 class Paper(BaseModel):
-    """Representation of an ArXiv research paper"""
+    """Consolidated representation of a research paper."""
 
-    id: str
-    title: str
-    authors: list[str]
-    summary: str
-    published: datetime
-    link: HttpUrl
-    category: str = Field(default="q-fin")
-    pdf_url: HttpUrl = Field(default=None)
+    metadata: PaperMetadata
+    content: PaperContent | None = None  # Content might be loaded lazily
+    last_updated: datetime = Field(
+        default_factory=datetime.utcnow, description="Timestamp of last update in cache."
+    )
 
-    @field_validator("published")
-    def parse_datetime(cls, value):
-        """Parse datetime from ArXiv string format if needed"""
-        if isinstance(value, datetime):
-            return value
+    # Allow easy access to metadata fields
+    @property
+    def paper_id(self) -> str:
+        return self.metadata.paper_id
 
-        # Handle ISO format
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except (ValueError, AttributeError):
-            pass
+    @property
+    def title(self) -> str:
+        return self.metadata.title
 
-        # Try other common formats
-        formats = [
-            "%Y-%m-%dT%H:%M:%SZ",  # ISO format without timezone
-            "%Y-%m-%d %H:%M:%S",  # Common format
-            "%a, %d %b %Y %H:%M:%S %Z",  # ArXiv format
-        ]
+    # Add other properties as needed
 
-        for fmt in formats:
-            try:
-                return datetime.strptime(value, fmt)
-            except (ValueError, TypeError):
-                continue
 
-        raise ValueError(f"Unable to parse datetime from {value}")
+class StrategyOutput(BaseModel):
+    """Structured output for generated trading strategies."""
 
-    class Config:
-        schema_extra = {
-            "example": {
-                "id": "http://arxiv.org/abs/2204.11824",
-                "title": "Deep Reinforcement Learning for Algorithmic Trading",
-                "authors": ["John Smith", "Jane Doe"],
-                "summary": "This paper explores deep reinforcement learning...",
-                "published": "2023-08-15T12:30:45Z",
-                "link": "https://arxiv.org/abs/2204.11824",
-                "category": "q-fin.TR",
-                "pdf_url": "https://arxiv.org/pdf/2204.11824.pdf",
-            }
-        }
+    python_code: str | None = Field(
+        None, description="Conceptual Python code outline for the strategy."
+    )
+    pseudocode: str | None = Field(
+        None, description="High-level pseudocode or logical steps of the strategy."
+    )
+    strategy_description: str | None = Field(
+        None, description="Explanation of the strategy, its goals, and paper inspirations."
+    )
+    how_to_use: str | None = Field(
+        None, description="Notes on implementation, data, parameters, and limitations."
+    )
 
 
 class PaperList(BaseModel):
