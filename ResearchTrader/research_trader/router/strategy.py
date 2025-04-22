@@ -1,268 +1,147 @@
 """
-Router for trading strategy generation endpoints
+Router for trading strategy generation endpoints.
 """
 
+import asyncio
+import logging
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
-from research_trader.config import Settings, get_settings
-from research_trader.models.strategy import StrategyRequest, StrategyResponse
-from research_trader.services.arxiv_client import ArxivClient
-from research_trader.services.cache import CacheService
-from research_trader.services.openai_client import OpenAIClient
+from research_trader.models.paper import Paper, StrategyOutput  # Import StrategyOutput
+from research_trader.services import (
+    ArxivService,  # If needed for checking existence
+    CacheService,
+    OpenAIService,
+    PaperProcessingService,  # If needed for on-the-fly processing (discouraged)
+)
 
-router = APIRouter(prefix="/strategy", tags=["strategy"])
+# Assuming service instances are created elsewhere and injected, or created here like in papers.py
+# For consistency with papers.py, let's instantiate them here for now.
+arxiv_service = ArxivService()
+cache_service = CacheService()
+openai_service = OpenAIService()
+paper_processing_service = PaperProcessingService(openai_service, cache_service)
+
+logger = logging.getLogger(__name__)
+
+# --- Request/Response Models ---
 
 
-@router.post("/", response_model=StrategyResponse, summary="Generate trading strategy")
-async def generate_strategy(request: StrategyRequest, config: Settings = Depends(get_settings)):
+class StrategyGenerationRequest(BaseModel):
+    """Request model for generating a trading strategy outline."""
+
+    paper_ids: list[str] = Field(
+        ...,
+        description="List of paper IDs (e.g., '2301.00001v1') to use as context. These papers must have been previously processed/cached.",
+        min_items=1,
+    )
+    strategy_prompt: str = Field(
+        ...,
+        description="Detailed prompt describing the desired strategy, including market, timeframe, risk, specific indicators, or logic inspired by the papers.",
+        example="Generate a mean-reversion strategy for AAPL stock on the hourly timeframe, using Bollinger Bands and RSI, inspired by the volatility analysis in paper 2301.00001v1.",
+    )
+    # Removed market, timeframe, risk_profile as separate fields - should be in the prompt.
+    # additional_context: Optional[str] = Field(None, description="Any other specific requirements or constraints.")
+
+
+class StrategyGenerationResponse(BaseModel):
+    """Response model for strategy generation, embedding the structured output."""
+
+    strategy: StrategyOutput | None = Field(
+        None, description="The generated structured strategy output."
+    )
+    context_paper_ids: list[str] = Field(description="List of paper IDs used for context.")
+    notes: str = Field(description="Notes about the generation process or potential issues.")
+
+
+# --- Router Definition ---
+router = APIRouter(prefix="/strategy", tags=["Strategy Generation"])
+
+
+# --- Endpoint ---
+
+
+@router.post("/", response_model=StrategyGenerationResponse)
+async def generate_strategy_outline(
+    request: StrategyGenerationRequest,
+) -> StrategyGenerationResponse:
     """
-    Generate a trading strategy based on the specified papers.
+    Generate a structured Python trading strategy outline based on the content of
+    previously processed/cached papers and a user prompt.
 
-    - **paper_ids**: List of ArXiv paper IDs to base the strategy on
-    - **market**: Target market (equities, forex, crypto)
-    - **timeframe**: Trading timeframe (tick, minute, hourly, daily)
-    - **risk_profile**: Risk profile (conservative, moderate, aggressive)
-    - **additional_context**: Additional user context or requirements
+    Requires paper IDs to be provided. The system fetches cached content
+    for these papers to inform the strategy generation.
 
-    Returns a complete trading strategy with Python code, usage notes, and limitations.
+    If any requested paper ID is not found in the cache, an error is returned.
+    The generated output is a *conceptual outline* and not production-ready.
     """
-    if not request.paper_ids:
-        raise HTTPException(status_code=400, detail="At least one paper ID is required")
-
-    # Collect paper summaries for context
-    paper_summaries = []
-
-    for paper_id in request.paper_ids:
-        # Try to get the summary
-        cached_summary = await CacheService.get_cached_summary(paper_id)
-        if cached_summary:
-            paper_summaries.append(cached_summary)
-            continue
-
-        # If no summary, try to get the paper and structure
-        cached_paper = await CacheService.get_cached_paper(paper_id)
-        if not cached_paper:
-            # Fetch paper from ArXiv
-            arxiv_client = ArxivClient(base_url=config.ARXIV_API_URL)
-            paper = await arxiv_client.fetch_paper_by_id(paper_id)
-
-            if not paper:
-                raise HTTPException(status_code=404, detail=f"Paper with ID {paper_id} not found")
-
-            await CacheService.cache_paper(paper_id, paper)
-            cached_paper = paper
-
-        # Get structure if available
-        cached_structure = await CacheService.get_cached_structure(paper_id)
-        if not cached_structure:
-            # Extract structure using OpenAI
-            openai_client = OpenAIClient(api_key=config.OPENAI_API_KEY, model=config.OPENAI_MODEL)
-            structure_dict = await openai_client.extract_paper_structure(cached_paper.summary)
-
-            # Cache structure
-            await CacheService.cache_structure(paper_id, structure_dict)
-            cached_structure = structure_dict
-
-        # Add minimal summary to context
-        paper_summary = {
-            "id": cached_paper.id,
-            "title": cached_paper.title,
-            "summary": cached_paper.summary,
-            "sections": cached_structure,
-        }
-        paper_summaries.append(paper_summary)
-
-    # Generate strategy
-    openai_client = OpenAIClient(api_key=config.OPENAI_API_KEY, model=config.OPENAI_MODEL)
-
-    # Convert request to dict format expected by OpenAI client
-    request_dict = {
-        "market": request.market,
-        "timeframe": request.timeframe,
-        "risk_profile": request.risk_profile,
-        "additional_context": request.additional_context,
-    }
-
-    # Full response will be built during streaming
-    full_response = ""
-    strategy_generator = openai_client.generate_trading_strategy(paper_summaries, request_dict)
-
-    async for chunk in strategy_generator:
-        full_response += chunk
-
-    # Parse the response to extract components
-    # We'll try to be smart about identifying parts from the unstructured text
-    python_code_start = full_response.find("```python")
-    if python_code_start != -1:
-        python_code_end = full_response.find("```", python_code_start + 8)
-        python_code = full_response[python_code_start + 8 : python_code_end].strip()
-    else:
-        # Fallback: look for any code block
-        python_code_start = full_response.find("```")
-        if python_code_start != -1:
-            python_code_end = full_response.find("```", python_code_start + 3)
-            python_code = full_response[python_code_start + 3 : python_code_end].strip()
-        else:
-            # No code block found, try to extract based on imports
-            lines = full_response.split("\n")
-            code_start = -1
-            for i, line in enumerate(lines):
-                if line.startswith("import ") or line.startswith("from "):
-                    code_start = i
-                    break
-
-            if code_start != -1:
-                python_code = "\n".join(lines[code_start:])
-            else:
-                python_code = (
-                    "# No code could be extracted automatically\n# Please review the full response"
-                )
-
-    # Extract strategy name from the beginning
-    lines = full_response.split("\n")
-    strategy_name = "Trading Strategy"
-    for line in lines[:10]:  # Look in first 10 lines
-        if line.strip() and not line.startswith("#") and not line.startswith("```"):
-            strategy_name = line.strip()
-            break
-
-    # Extract description - text before code block
-    if python_code_start != -1:
-        description = full_response[:python_code_start].strip()
-    else:
-        # Take first few paragraphs as description
-        paragraphs = [p for p in full_response.split("\n\n") if p.strip()]
-        description = "\n\n".join(paragraphs[:3]) if paragraphs else "No description available"
-
-    # Look for usage notes and limitations near the end
-    usage_notes = "See full response for usage details"
-    limitations = "See full response for limitations"
-
-    lower_response = full_response.lower()
-
-    # Check for usage notes section
-    usage_notes_keywords = ["usage", "how to use", "parameters", "implementation"]
-    for keyword in usage_notes_keywords:
-        pos = lower_response.find(keyword)
-        if pos != -1:
-            end_pos = lower_response.find("#", pos)
-            if end_pos == -1:
-                end_pos = len(lower_response)
-
-            # Extract paragraph
-            paragraph_start = lower_response.rfind("\n\n", 0, pos)
-            if paragraph_start == -1:
-                paragraph_start = 0
-
-            paragraph_end = lower_response.find("\n\n", pos)
-            if paragraph_end == -1:
-                paragraph_end = len(lower_response)
-
-            usage_notes = full_response[paragraph_start:paragraph_end].strip()
-            break
-
-    # Check for limitations section
-    limitations_keywords = ["limitation", "caveat", "consideration", "warning"]
-    for keyword in limitations_keywords:
-        pos = lower_response.find(keyword)
-        if pos != -1:
-            # Extract paragraph
-            paragraph_start = lower_response.rfind("\n\n", 0, pos)
-            if paragraph_start == -1:
-                paragraph_start = 0
-
-            paragraph_end = lower_response.find("\n\n", pos)
-            if paragraph_end == -1:
-                paragraph_end = len(lower_response)
-
-            limitations = full_response[paragraph_start:paragraph_end].strip()
-            break
-
-    # Create response
-    response = StrategyResponse(
-        strategy_name=strategy_name,
-        description=description,
-        python_code=python_code,
-        paper_references=request.paper_ids,
-        usage_notes=usage_notes,
-        limitations=limitations,
+    logger.info(
+        f"Received strategy generation request: prompt='{request.strategy_prompt[:50]}...', paper_ids={request.paper_ids}"
     )
 
+    # 1. Fetch context papers from cache
+    context_papers: list[Paper] = []
+    missing_ids = []
+    fetch_tasks = [cache_service.get_paper(pid) for pid in request.paper_ids]
+    results = await asyncio.gather(*fetch_tasks)
+
+    for i, paper in enumerate(results):
+        paper_id = request.paper_ids[i]
+        if paper and paper.content:  # Ensure paper and its content exists
+            context_papers.append(paper)
+        else:
+            logger.warning(
+                f"Paper ID {paper_id} not found in cache or lacks content for strategy generation."
+            )
+            missing_ids.append(paper_id)
+
+    # Handle missing papers
+    if missing_ids:
+        raise HTTPException(
+            status_code=404,
+            detail=f"The following paper IDs were not found in the cache or lack processed content: {', '.join(missing_ids)}. Please process them first via the /papers/{{paper_id}} endpoint.",
+        )
+
+    if not context_papers:  # Safeguard
+        raise HTTPException(
+            status_code=400, detail="No valid context papers found for the provided IDs."
+        )
+
+    # 2. Generate strategy using OpenAI Service
+    logger.info(
+        f"Generating structured strategy using {len(context_papers)} papers and prompt: '{request.strategy_prompt[:50]}...'"
+    )
+    notes = "Strategy generation initiated."
+    generated_strategy_output: StrategyOutput | None = None
+    try:
+        # This now returns a StrategyOutput object or None
+        generated_strategy_output = await openai_service.generate_strategy(
+            papers=context_papers, strategy_prompt=request.strategy_prompt
+        )
+
+        if generated_strategy_output is None:
+            notes = "Strategy generation failed or produced no output."
+            logger.error(
+                f"OpenAI service failed to generate strategy for prompt: '{request.strategy_prompt[:50]}...'"
+            )
+        else:
+            notes = "Structured strategy outline generated successfully."
+
+    except Exception as e:
+        # Catch potential exceptions from the service layer
+        logger.error(f"Error during OpenAI strategy generation: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail="An error occurred while generating the strategy code."
+        )
+
+    # 3. Format and return response
+    response = StrategyGenerationResponse(
+        strategy=generated_strategy_output,  # Assign the generated object here
+        context_paper_ids=[p.paper_id for p in context_papers],
+        notes=notes,
+    )
+    logger.info(
+        f"Successfully completed strategy generation request for prompt: '{request.strategy_prompt[:50]}...'"
+    )
     return response
-
-
-@router.post("/stream", summary="Generate trading strategy (streaming)")
-async def generate_strategy_stream(
-    request: StrategyRequest, config: Settings = Depends(get_settings)
-):
-    """
-    Generate a trading strategy with streaming response.
-
-    Same parameters as the non-streaming endpoint, but returns chunks of the
-    generated strategy as they are produced.
-    """
-    if not request.paper_ids:
-        raise HTTPException(status_code=400, detail="At least one paper ID is required")
-
-    # Collect paper summaries for context (same as non-streaming endpoint)
-    paper_summaries = []
-
-    for paper_id in request.paper_ids:
-        # Try to get the summary
-        cached_summary = await CacheService.get_cached_summary(paper_id)
-        if cached_summary:
-            paper_summaries.append(cached_summary)
-            continue
-
-        # If no summary, try to get the paper and structure
-        cached_paper = await CacheService.get_cached_paper(paper_id)
-        if not cached_paper:
-            # Fetch paper from ArXiv
-            arxiv_client = ArxivClient(base_url=config.ARXIV_API_URL)
-            paper = await arxiv_client.fetch_paper_by_id(paper_id)
-
-            if not paper:
-                raise HTTPException(status_code=404, detail=f"Paper with ID {paper_id} not found")
-
-            await CacheService.cache_paper(paper_id, paper)
-            cached_paper = paper
-
-        # Get structure if available
-        cached_structure = await CacheService.get_cached_structure(paper_id)
-        if not cached_structure:
-            # Extract structure using OpenAI
-            openai_client = OpenAIClient(api_key=config.OPENAI_API_KEY, model=config.OPENAI_MODEL)
-            structure_dict = await openai_client.extract_paper_structure(cached_paper.summary)
-
-            # Cache structure
-            await CacheService.cache_structure(paper_id, structure_dict)
-            cached_structure = structure_dict
-
-        # Add minimal summary to context
-        paper_summary = {
-            "id": cached_paper.id,
-            "title": cached_paper.title,
-            "summary": cached_paper.summary,
-            "sections": cached_structure,
-        }
-        paper_summaries.append(paper_summary)
-
-    # Generate strategy with streaming
-    openai_client = OpenAIClient(api_key=config.OPENAI_API_KEY, model=config.OPENAI_MODEL)
-
-    # Convert request to dict format expected by OpenAI client
-    request_dict = {
-        "market": request.market,
-        "timeframe": request.timeframe,
-        "risk_profile": request.risk_profile,
-        "additional_context": request.additional_context,
-    }
-
-    async def stream_generator():
-        strategy_generator = openai_client.generate_trading_strategy(paper_summaries, request_dict)
-        async for chunk in strategy_generator:
-            yield chunk
-
-    return StreamingResponse(stream_generator(), media_type="text/plain")
